@@ -11,3 +11,4 @@ wheels/
 
 data/
 runs/cat_detection/detection_output_01/
+runs/cat_detection/tracking_output_01/
