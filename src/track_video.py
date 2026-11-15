@@ -8,7 +8,7 @@ import torch
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 
-from tracking import TrackConfirmation
+from tracking import PersistentIdentityManager, TrackConfirmation
 
 # --------------------------------------------------
 # Configuration
@@ -19,11 +19,11 @@ MODEL_PATH = "runs/cat_detection/experiment_01/weights/best.pt"
 # VIDEO_PATH = "data/raw_videos/cats_009.mp4"
 VIDEO_PATH = "data/raw_videos/cats_010.mp4"
 
-EXP_NO = 5
+EXP_NO = 6
 
 OUTPUT_PATH = (
     f"runs/cat_detection/tracking_output_01/"
-    f"tracking_output_0{EXP_NO}_b_filtered.mp4"
+    f"tracking_output_0{EXP_NO}_b_identity_manager.mp4"
 )
 
 CONFIDENCE = 0.10
@@ -77,7 +77,13 @@ def main():
         max_missed_during_confirmation=4,
         max_missed_after_confirmation=60,
     )
-
+    
+    identity_manager = PersistentIdentityManager(
+        min_observations=12,
+        min_class_ratio=0.85,
+        owner_timeout_frames=90,
+    )
+    
     # Create output video
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
@@ -99,10 +105,6 @@ def main():
 
     raw_ids_seen = set()
     confirmed_ids_seen = set()
-
-    # Map BoT-SORT IDs to sequential display IDs
-    display_id_map = {}
-    next_display_id = 1
 
     print("\nStarting BoT-SORT tracking...\n")
 
@@ -130,48 +132,40 @@ def main():
 
         result = results[0]
 
-        # --------------------------------------------------
-        # Collect raw BoT-SORT IDs
-        # --------------------------------------------------
 
+        # Collect raw BoT-SORT IDs.
         if result.boxes is not None and result.boxes.id is not None:
-
             raw_ids_seen.update(
                 result.boxes.id.int().cpu().tolist()
             )
 
-        # --------------------------------------------------
-        # Track confirmation
-        # IMPORTANT: exactly once per frame
-        # --------------------------------------------------
-
+        # Update confirmation exactly once per frame.
         confirmed_ids = confirmation.update(result)
 
         confirmed_ids_seen.update(confirmed_ids)
 
-        # --------------------------------------------------
-        # Filter unconfirmed tracks
-        # --------------------------------------------------
+        # Update persistent identity manager.
+        identity_by_track = identity_manager.update(
+            result,
+            confirmed_ids,
+            frame_number,
+        )
 
+        # Keep only detections with a confirmed persistent identity.
         if result.boxes is not None and result.boxes.id is not None:
 
             raw_ids = result.boxes.id.int().cpu().tolist()
 
             keep = torch.tensor(
                 [
-                    track_id in confirmed_ids
+                    track_id in identity_by_track
                     for track_id in raw_ids
                 ],
                 dtype=torch.bool,
                 device=result.boxes.id.device,
             )
 
-            # Keep only confirmed detections
             filtered_result = result[keep]
-
-            # --------------------------------------------------
-            # Assign sequential display IDs
-            # --------------------------------------------------
 
             if (
                 filtered_result.boxes is not None
@@ -182,33 +176,29 @@ def main():
                     filtered_result.boxes.id.int().cpu().tolist()
                 )
 
-                for track_id in original_ids:
-
-                    if track_id not in display_id_map:
-
-                        display_id_map[track_id] = next_display_id
-                        next_display_id += 1
-
-                # Copy the underlying box data.
-                # Tracked box layout:
-                # x1, y1, x2, y2, confidence, class, track_id
+                # Stable display ID:
+                # Marko = 1
+                # Taras = 2
+                identity_display_ids = {
+                    "marko": 1,
+                    "taras": 2,
+                }
 
                 box_data = filtered_result.boxes.data.clone()
 
                 display_ids = torch.tensor(
                     [
-                        display_id_map[track_id]
+                        identity_display_ids[identity_by_track[track_id]]
                         for track_id in original_ids
                     ],
                     dtype=box_data.dtype,
                     device=box_data.device,
                 )
 
-                # Replace the track ID column
+                # Ultralytics tracked box layout:
+                # x1, y1, x2, y2, track_id, confidence, class_id
                 box_data[:, 4] = display_ids
 
-                # Construct new Results object.
-                # Ultralytics automatically wraps the tensor in a Boxes object.
                 filtered_result = Results(
                     orig_img=filtered_result.orig_img,
                     path=filtered_result.path,
@@ -216,13 +206,11 @@ def main():
                     boxes=box_data,
                 )
 
-            # Original Ultralytics rendering
             annotated_frame = filtered_result.plot()
 
         else:
-
-            # No tracked detections in this frame
             annotated_frame = result.plot()
+
 
         # --------------------------------------------------
         # Write output frame
@@ -248,18 +236,20 @@ def main():
     # --------------------------------------------------
     # Final statistics
     # --------------------------------------------------
-
     print("\nTracking statistics")
     print("------------------------------")
 
     print(f"Raw BoT-SORT IDs: {len(raw_ids_seen)}")
     print(f"Confirmed IDs:    {len(confirmed_ids_seen)}")
-    print(f"Displayed IDs:    {len(display_id_map)}")
+
+    print("\nPersistent identity assignments:")
+
+    for track_id, identity in sorted(
+        identity_manager.track_identity.items()
+    ):
+        print(f"  BoT-SORT ID {track_id} -> {identity.upper()}")
 
     print("------------------------------")
-
-    print("\nTracking complete!")
-    print("Output saved to:", OUTPUT_PATH)
 
 
 if __name__ == "__main__":
